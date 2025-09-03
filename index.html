@@ -1,0 +1,441 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>KNN Visualizer — Games Dataset</title>
+  <style>
+    body { font-family: sans-serif; margin: 0; padding: 0; background: #fafbfc; }
+    .container { max-width: 900px; margin: 32px auto; background: #fff; border-radius: 8px; box-shadow: 0 2px 8px #0001; padding: 24px; }
+    h1 { font-size: 1.6em; margin-bottom: 0.2em; }
+    .section { margin-bottom: 24px; }
+    label { margin-right: 8px; }
+    select, input[type=number], input[type=text] { margin-right: 12px; }
+    .preview-table { border-collapse: collapse; margin-top: 8px; font-size: 0.95em; }
+    .preview-table th, .preview-table td { border: 1px solid #ddd; padding: 4px 8px; }
+    .preview-table th { background: #f0f0f0; }
+    .schema { font-size: 0.95em; color: #555; margin-top: 4px; }
+    .controls { margin-bottom: 12px; }
+    .legend { font-size: 0.95em; margin-top: 8px; }
+    .note { font-size: 0.92em; color: #a55; margin-top: 6px; }
+    #plot { background: #f8f8ff; border: 1px solid #ccc; border-radius: 6px; cursor: crosshair; }
+    .result-label { font-weight: bold; font-size: 1.1em; margin-top: 10px; }
+    .gentle { color: #888; font-size: 0.98em; margin-top: 8px; }
+    .bucket-select { margin-top: 6px; }
+    .toggle { margin-left: 8px; }
+  </style>
+</head>
+<body>
+<div class="container">
+  <h1>KNN Visualizer — Games Dataset</h1>
+  <div class="section">
+    <label for="csvFile">Upload your CSV:</label>
+    <input type="file" id="csvFile" accept=".csv">
+    <span class="gentle">(No upload: runs fully offline)</span>
+  </div>
+  <div id="preview" class="section" style="display:none;"></div>
+  <div id="schema" class="section" style="display:none;"></div>
+  <div id="controls" class="section" style="display:none;"></div>
+  <canvas id="plot" width="600" height="600" style="display:none;"></canvas>
+  <div id="legend" class="legend" style="display:none;"></div>
+  <div id="result" class="result-label"></div>
+  <div id="note" class="note"></div>
+</div>
+<script>
+// --- Agent Checklist ---
+// FileReader to read CSV locally; robust parse (quoted fields, commas)
+// Infer types; offer only numeric columns for X/Y
+// If target has >2 classes, provide UI to select/map to two
+// Implement KNN with Euclidean distance; odd K; tie-break by nearest neighbor
+// Consider z-score scaling toggle
+// Two colors (Blue/Orange), gray query point pre-classification
+// Ask clarifying questions for delimiter, encoding (UTF-8 assumed), thresholds, subsample size, mappings
+
+// --- CSV Parsing ---
+function parseCSV(text, delimiter=',') {
+  // Minimal robust parser (handles quoted fields, commas)
+  const rows = [];
+  let row = [], field = '', inQuotes = false;
+  for (let i = 0, c; i < text.length; i++) {
+    c = text[i];
+    if (inQuotes) {
+      if (c === '"') {
+        if (text[i+1] === '"') { field += '"'; i++; }
+        else inQuotes = false;
+      } else field += c;
+    } else if (c === '"') inQuotes = true;
+    else if (c === delimiter) { row.push(field); field = ''; }
+    else if (c === '\n' || c === '\r') {
+      if (field || row.length) { row.push(field); rows.push(row); row = []; field = ''; }
+      if (c === '\r' && text[i+1] === '\n') i++;
+    } else field += c;
+  }
+  if (field || row.length) { row.push(field); rows.push(row); }
+  return rows.filter(r => r.length && r.some(f => f.trim() !== ''));
+}
+
+// --- Type Inference ---
+function inferTypes(rows) {
+  const header = rows[0];
+  const types = header.map((_, col) => {
+    let nums = 0, total = 0;
+    for (let i = 1; i < Math.min(rows.length, 21); i++) {
+      const v = rows[i][col];
+      if (v === undefined) continue;
+      if (!isNaN(parseFloat(v)) && v.trim() !== '') nums++;
+      total++;
+    }
+    return nums/total > 0.8 ? 'numeric' : 'text';
+  });
+  return types;
+}
+
+// --- Globals ---
+let data = [], header = [], types = [], xCol = '', yCol = '', targetCol = '', targetMap = null, threshold = 7.5, yearThreshold = 2015, genreBucket = ["Strategy", "Simulation"], scaling = false, subsample = 0, query = null, k = 3, showLines = false;
+let targetMode = 'HighRating';
+let targetOptions = [];
+let plotMinMax = {};
+
+// --- File Upload ---
+document.getElementById('csvFile').addEventListener('change', function(e) {
+  const file = e.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = function(evt) {
+    const text = evt.target.result;
+    let rows = parseCSV(text);
+    if (rows.length < 2) { alert('CSV appears empty or malformed.'); return; }
+    header = rows[0];
+    types = inferTypes(rows);
+    data = rows.slice(1).map(r => {
+      let o = {};
+      header.forEach((h, i) => o[h] = r[i]);
+      return o;
+    });
+    showPreview(rows);
+    showSchema();
+    setupControls();
+    document.getElementById('plot').style.display = '';
+    document.getElementById('legend').style.display = '';
+    drawPlot();
+  };
+  reader.readAsText(file, 'UTF-8');
+});
+
+// --- Preview & Schema ---
+function showPreview(rows) {
+  let html = '<b>Preview (first 10 rows):</b><br><table class="preview-table"><tr>';
+  rows[0].forEach(h => html += `<th>${h}</th>`);
+  html += '</tr>';
+  for (let i = 1; i < Math.min(rows.length, 11); i++) {
+    html += '<tr>';
+    rows[i].forEach(v => html += `<td>${v}</td>`);
+    html += '</tr>';
+  }
+  html += '</table>';
+  document.getElementById('preview').innerHTML = html;
+  document.getElementById('preview').style.display = '';
+}
+function showSchema() {
+  let html = '<b>Inferred schema:</b> <span class="schema">';
+  header.forEach((h, i) => {
+    html += `${h}: <b>${types[i]}</b> &nbsp;`;
+  });
+  html += '</span>';
+  document.getElementById('schema').innerHTML = html;
+  document.getElementById('schema').style.display = '';
+}
+
+// --- Controls ---
+function setupControls() {
+  // Numeric columns for X/Y
+  const numericCols = header.filter((h, i) => types[i] === 'numeric');
+  // Target options
+  targetOptions = [
+    {name:'HighRating', label:'High vs Low User Rating', desc:'User Rating ≥ threshold'},
+    {name:'Success', label:'Success Prediction', desc:'Predict Succeeds vs Doesn\'t'},
+    {name:'PCvsConsole', label:'PC vs Console', desc:'Platform == "PC"'},
+    {name:'Nintendo', label:'Nintendo vs Non-Nintendo', desc:'Platform == "Nintendo Switch"'},
+    {name:'Recent', label:'Recent vs Classic', desc:'Release Year ≥ threshold'},
+    {name:'GenreBucket', label:'Strategy/Simulation vs Other', desc:'Genre bucket'}
+  ];
+  // Defaults
+  xCol = numericCols.includes('Release Year') ? 'Release Year' : numericCols[0];
+  yCol = numericCols.includes('User Rating') ? 'User Rating' : numericCols[1] || numericCols[0];
+  targetCol = 'User Rating';
+  let html = '<div class="controls">';
+  html += `<label>X:</label><select id="xCol">${numericCols.map(c => `<option${c===xCol?' selected':''}>${c}</option>`).join('')}</select>`;
+  html += `<label>Y:</label><select id="yCol">${numericCols.map(c => `<option${c===yCol?' selected':''}>${c}</option>`).join('')}</select>`;
+  html += `<label>Target:</label><select id="targetMode">${targetOptions.map(o => `<option value="${o.name}">${o.label}</option>`).join('')}</select>`;
+  html += `<span id="targetExtra"></span>`;
+  html += `<br><label>K:</label><select id="kSel">${[1,3,5,7,9].map(v => `<option${v===k?' selected':''}>${v}</option>`).join('')}</select>`;
+  html += `<button id="resetBtn">Reset Query</button>`;
+  html += `<button id="randomBtn">Randomize Data</button>`;
+  html += `<label class="toggle"><input type="checkbox" id="scaleToggle"> Z-score scaling</label>`;
+  html += `<label class="toggle"><input type="checkbox" id="showLines"> Show K neighbor lines</label>`;
+  html += '</div>';
+  document.getElementById('controls').innerHTML = html;
+  document.getElementById('controls').style.display = '';
+  setupTargetExtra();
+  document.getElementById('xCol').onchange = e => { xCol = e.target.value; drawPlot(); };
+  document.getElementById('yCol').onchange = e => { yCol = e.target.value; drawPlot(); };
+  document.getElementById('targetMode').onchange = e => { targetMode = e.target.value; setupTargetExtra(); drawPlot(); };
+  document.getElementById('kSel').onchange = e => { k = parseInt(e.target.value); drawPlot(); };
+  document.getElementById('resetBtn').onclick = () => { query = null; document.getElementById('result').innerText = ''; drawPlot(); };
+  document.getElementById('randomBtn').onclick = () => { subsample = Math.floor(Math.random()*data.length*0.5)+10; drawPlot(); };
+  document.getElementById('scaleToggle').onchange = e => { scaling = e.target.checked; drawPlot(); };
+  document.getElementById('showLines').onchange = e => { showLines = e.target.checked; drawPlot(); };
+}
+function setupTargetExtra() {
+  let html = '';
+    if (targetMode === 'HighRating') {
+      html += `&nbsp;Threshold: <input type="number" id="ratingThresh" value="${threshold}" step="0.1" style="width:60px;">`;
+      setTimeout(() => {
+        document.getElementById('ratingThresh').onchange = e => { threshold = parseFloat(e.target.value); drawPlot(); };
+      }, 10);
+      document.getElementById('note').innerText = 'Note: User Rating is used as both feature and target. This may cause data leakage.';
+    } else if (targetMode === 'Success') {
+      html += `&nbsp;Success threshold: <input type="number" id="successThresh" value="8.0" step="0.1" style="width:60px;">`;
+      // Multi-select dropdown for genres
+      let genreSet = Array.from(new Set(data.map(r => r['Genre']).filter(g => g && g.trim())));
+      html += `<span class="bucket-select"> Popular genres: <select id="successGenres" multiple size="${Math.min(genreSet.length,6)}" style="width:180px;">`;
+      genreSet.forEach(g => {
+        html += `<option value="${g}" selected>${g}</option>`;
+      });
+      html += `</select></span>`;
+      html += `&nbsp;<label><input type="checkbox" id="successGenre" checked> Restrict to popular genres</label>`;
+      setTimeout(() => {
+        document.getElementById('successThresh').onchange = () => { drawPlot(); showSuccessSummary(); };
+        document.getElementById('successGenre').onchange = () => { drawPlot(); showSuccessSummary(); };
+        document.getElementById('successGenres').onchange = () => { drawPlot(); showSuccessSummary(); };
+      }, 10);
+      document.getElementById('note').innerText = 'Note: Predicts if a game Succeeds (User Rating ≥ threshold, optionally in selected genres).';
+    } else if (targetMode === 'PCvsConsole') {
+      document.getElementById('note').innerText = 'Note: Platform mapped to PC vs Console.';
+    } else if (targetMode === 'Nintendo') {
+      html += `&nbsp;<label><input type="checkbox" id="strictNintendo"> Strict equality</label>`;
+      setTimeout(() => {
+        document.getElementById('strictNintendo').onchange = drawPlot;
+      }, 10);
+      document.getElementById('note').innerText = 'Note: Platform mapped to Nintendo vs Non-Nintendo.';
+    } else if (targetMode === 'Recent') {
+      html += `&nbsp;Year threshold: <input type="number" id="yearThresh" value="${yearThreshold}" step="1" style="width:60px;">`;
+      setTimeout(() => {
+        document.getElementById('yearThresh').onchange = e => { yearThreshold = parseInt(e.target.value); drawPlot(); };
+      }, 10);
+      html += `&nbsp;<label><input type="checkbox" id="dropYear"> Drop Release Year from features</label>`;
+      setTimeout(() => {
+        document.getElementById('dropYear').onchange = drawPlot;
+      }, 10);
+      document.getElementById('note').innerText = 'Note: Using Release Year as both feature and target may produce trivial boundaries.';
+    } else if (targetMode === 'GenreBucket') {
+      html += `<span class="bucket-select">Genres in bucket: <input type="text" id="genreBucket" value="${genreBucket.join(',')}" style="width:120px;"> (comma-separated)</span>`;
+      setTimeout(() => {
+        document.getElementById('genreBucket').onchange = e => { genreBucket = e.target.value.split(',').map(s=>s.trim()); drawPlot(); };
+      }, 10);
+      document.getElementById('note').innerText = 'Note: Genre mapped to Strategy/Simulation vs Other.';
+    }
+    document.getElementById('targetExtra').innerHTML = html;
+    showSuccessSummary();
+}
+
+// --- Target Mapping ---
+function getTarget(row) {
+  if (targetMode === 'HighRating') {
+    return parseFloat(row['User Rating']) >= threshold ? 'HighRating' : 'LowRating';
+  } else if (targetMode === 'Success') {
+    let thresh = parseFloat(document.getElementById('successThresh')?.value || '8.0');
+    let genreCheck = document.getElementById('successGenre')?.checked;
+    let genreList = [];
+    let genreSelect = document.getElementById('successGenres');
+    if (genreSelect) {
+      for (let i = 0; i < genreSelect.options.length; i++) {
+        if (genreSelect.options[i].selected) genreList.push(genreSelect.options[i].value);
+      }
+    }
+    let isPopular = genreCheck ? genreList.includes(row['Genre']) : true;
+    return (parseFloat(row['User Rating']) >= thresh && isPopular) ? 'Succeeds' : "Doesn't";
+  } else if (targetMode === 'PCvsConsole') {
+    return row['Platform'] === 'PC' ? 'PC' : 'Console';
+  } else if (targetMode === 'Nintendo') {
+    let strict = document.getElementById('strictNintendo')?.checked;
+    if (strict) return row['Platform'] === 'Nintendo Switch' ? 'Nintendo' : 'NonNintendo';
+    else return (row['Platform']||'').includes('Nintendo') ? 'Nintendo' : 'NonNintendo';
+  } else if (targetMode === 'Recent') {
+    return parseInt(row['Release Year']) >= yearThreshold ? 'Recent' : 'Classic';
+  } else if (targetMode === 'GenreBucket') {
+    return genreBucket.includes(row['Genre']) ? 'Strategy/Simulation' : 'Other';
+  }
+  return '';
+}
+function getTargetLabels() {
+  if (targetMode === 'HighRating') return ['HighRating','LowRating'];
+  if (targetMode === 'Success') return ['Succeeds',"Doesn't"];
+  if (targetMode === 'PCvsConsole') return ['PC','Console'];
+  if (targetMode === 'Nintendo') return ['Nintendo','NonNintendo'];
+  if (targetMode === 'Recent') return ['Recent','Classic'];
+  if (targetMode === 'GenreBucket') return ['Strategy/Simulation','Other'];
+  return [];
+}
+
+  function showSuccessSummary() {
+    if (targetMode !== 'Success' || !data.length) {
+      document.getElementById('result').innerText = '';
+      return;
+    }
+    let thresh = parseFloat(document.getElementById('successThresh')?.value || '8.0');
+    let genreCheck = document.getElementById('successGenre')?.checked;
+    let genreList = (document.getElementById('successGenres')?.value || '').split(',').map(s=>s.trim()).filter(s=>s);
+    let succ = 0, fail = 0;
+    data.forEach(row => {
+      let isPopular = genreCheck ? genreList.includes(row['Genre']) : true;
+      if (parseFloat(row['User Rating']) >= thresh && isPopular) succ++;
+      else fail++;
+    });
+    document.getElementById('result').innerHTML = `<span style="color:#1976d2;">Succeeds: ${succ}</span> &nbsp; <span style="color:#ff9800;">Doesn't: ${fail}</span>`;
+  }
+
+// --- Data Prep ---
+function getPlotData() {
+  let rows = data.slice();
+  if (subsample > 0 && subsample < rows.length) {
+    rows = rows.slice();
+    for (let i = rows.length-1; i > 0; i--) {
+      const j = Math.floor(Math.random()*(i+1));
+      [rows[i], rows[j]] = [rows[j], rows[i]];
+    }
+    rows = rows.slice(0, subsample);
+  }
+  let x = xCol, y = yCol;
+  if (targetMode === 'Recent' && document.getElementById('dropYear')?.checked) {
+    x = yCol;
+    y = header.find(h => h !== xCol && h !== yCol && types[header.indexOf(h)] === 'numeric') || yCol;
+  }
+  let pts = rows.map(r => ({
+    x: parseFloat(r[x]),
+    y: parseFloat(r[y]),
+    label: getTarget(r),
+    raw: r
+  })).filter(p => !isNaN(p.x) && !isNaN(p.y));
+  if (scaling) {
+    let mx = meanStd(pts.map(p=>p.x)), my = meanStd(pts.map(p=>p.y));
+    pts.forEach(p => { p.x = (p.x-mx.mean)/mx.std; p.y = (p.y-my.mean)/my.std; });
+    plotMinMax = {x:[-3,3],y:[-3,3]};
+  } else {
+    let xs = pts.map(p=>p.x), ys = pts.map(p=>p.y);
+    plotMinMax = {x:[Math.min(...xs),Math.max(...xs)],y:[Math.min(...ys),Math.max(...ys)]};
+  }
+  return pts;
+}
+function meanStd(arr) {
+  let mean = arr.reduce((a,b)=>a+b,0)/arr.length;
+  let std = Math.sqrt(arr.reduce((a,b)=>a+(b-mean)**2,0)/arr.length);
+  return {mean,std:std||1};
+}
+
+// --- Plotting ---
+function drawPlot() {
+  const canvas = document.getElementById('plot');
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  let pts = getPlotData();
+  let labels = getTargetLabels();
+  let colors = { [labels[0]]:'#1976d2', [labels[1]]:'#ff9800' };
+  // Axes
+  ctx.save();
+  ctx.strokeStyle = '#bbb'; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(40,560); ctx.lineTo(560,560); ctx.lineTo(560,40); ctx.stroke();
+  ctx.restore();
+  // Axis labels
+  ctx.font = '14px sans-serif'; ctx.fillStyle = '#333';
+  ctx.fillText(xCol + (scaling?' (z-score)':''), 260, 590);
+  ctx.save(); ctx.translate(10,300); ctx.rotate(-Math.PI/2);
+  ctx.fillText(yCol + (scaling?' (z-score)':''), 0,0); ctx.restore();
+  // Ticks
+  for (let i=0;i<=5;i++) {
+    let tx = 40 + i*104, ty = 560 - i*104;
+    ctx.fillText(((plotMinMax.x[0]*(5-i)+plotMinMax.x[1]*i)/5).toFixed(2), tx-12, 575);
+    ctx.fillText(((plotMinMax.y[0]*i+plotMinMax.y[1]*(5-i))/5).toFixed(2), 5, ty+5);
+  }
+  // Points
+  pts.forEach(p => {
+    let px = scaleX(p.x), py = scaleY(p.y);
+    ctx.beginPath(); ctx.arc(px,py,6,0,2*Math.PI);
+    ctx.fillStyle = colors[p.label]||'#aaa';
+    ctx.globalAlpha = 0.85;
+    ctx.fill(); ctx.globalAlpha = 1;
+    ctx.strokeStyle = '#fff'; ctx.lineWidth = 2; ctx.stroke();
+  });
+  // Query point
+  if (query) {
+    let px = scaleX(query.x), py = scaleY(query.y);
+    ctx.beginPath(); ctx.arc(px,py,8,0,2*Math.PI);
+    ctx.fillStyle = '#888'; ctx.globalAlpha = 0.7; ctx.fill(); ctx.globalAlpha = 1;
+    ctx.strokeStyle = '#333'; ctx.lineWidth = 2; ctx.stroke();
+  }
+  // Legend
+  let legend = `<span style="color:${colors[labels[0]]};font-weight:bold;">&#9679; ${labels[0]}</span> &nbsp; <span style="color:${colors[labels[1]]};font-weight:bold;">&#9679; ${labels[1]}</span> &nbsp; <span style="color:#888;">&#9679; Query</span>`;
+  document.getElementById('legend').innerHTML = legend;
+}
+function scaleX(x) {
+  return 40 + (x-plotMinMax.x[0])/(plotMinMax.x[1]-plotMinMax.x[0])*520;
+}
+function scaleY(y) {
+  return 560 - (y-plotMinMax.y[0])/(plotMinMax.y[1]-plotMinMax.y[0])*520;
+}
+
+// --- Plot Interactions ---
+// Removed ability to place query dot on the graph
+
+// --- Classify Button ---
+let classifyBtn = document.createElement('button');
+classifyBtn.innerText = 'Classify';
+classifyBtn.style.marginRight = '12px';
+classifyBtn.onclick = function() {
+  if (!query) {
+    document.getElementById('result').innerHTML = '<span class="gentle">Click in the plot to place a query point.</span>';
+    return;
+  }
+  let pts = getPlotData();
+  let dists = pts.map(p => ({p, d:euclid(query,p)}));
+  dists.sort((a,b)=>a.d-b.d);
+  let neighbors = dists.slice(0,k);
+  let votes = {};
+  neighbors.forEach(n => { votes[n.p.label] = (votes[n.p.label]||0)+1; });
+  let labels = getTargetLabels();
+  let maxVote = Math.max(...labels.map(l=>votes[l]||0));
+  let winners = labels.filter(l => (votes[l]||0) === maxVote);
+  let resultLabel;
+  if (winners.length === 1) resultLabel = winners[0];
+  else {
+    // Tie-break by nearest neighbor label
+    resultLabel = neighbors[0].p.label;
+  }
+  let colors = { [labels[0]]:'#1976d2', [labels[1]]:'#ff9800' };
+  // Draw query point colored
+  const canvas = document.getElementById('plot');
+  const ctx = canvas.getContext('2d');
+  let px = scaleX(query.x), py = scaleY(query.y);
+  ctx.beginPath(); ctx.arc(px,py,10,0,2*Math.PI);
+  ctx.fillStyle = colors[resultLabel]; ctx.globalAlpha = 0.9; ctx.fill(); ctx.globalAlpha = 1;
+  ctx.strokeStyle = '#333'; ctx.lineWidth = 2; ctx.stroke();
+  // Optionally draw lines to neighbors
+  if (showLines) {
+    ctx.save(); ctx.strokeStyle = '#aaa'; ctx.setLineDash([4,4]);
+    neighbors.forEach(n => {
+      ctx.beginPath(); ctx.moveTo(px,py);
+      ctx.lineTo(scaleX(n.p.x),scaleY(n.p.y));
+      ctx.stroke();
+    });
+    ctx.restore();
+  }
+  document.getElementById('result').innerHTML = `<span style="color:${colors[resultLabel]};">Class: ${resultLabel} (${maxVote}/${k})</span>`;
+};
+document.getElementById('controls').appendChild(classifyBtn);
+
+// --- Euclidean Distance ---
+function euclid(a,b) {
+  return Math.sqrt((a.x-b.x)**2 + (a.y-b.y)**2);
+}
+</script>
+</body>
+</html>
